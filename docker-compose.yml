@@ -1,0 +1,11 @@
+version: '3'
+services:
+  pixai-proxy:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./storage:/storage  # 将宿主机的 ./storage 目录挂载到容器内
+    env_file:
+      - .env
+    restart: unless-stopped

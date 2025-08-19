@@ -25,9 +25,9 @@ var CONFIG struct {
 	PathPrefix      string
 	AllowedOrigins  []string
 	APIKey          string
-	StoragePath     string // 本地存储路径
+	StoragePath     string
 	ListenAddr      string
-	FileExpiryHours time.Duration // 文件过期时间（小时）
+	FileExpiryHours time.Duration
 }
 
 func init() {
@@ -40,14 +40,12 @@ func init() {
 		CONFIG.AllowedOrigins[i] = strings.TrimSpace(CONFIG.AllowedOrigins[i])
 	}
 	CONFIG.APIKey = getEnv("API_KEY", "")
-	CONFIG.StoragePath = getEnv("STORAGE_PATH", "./storage") // 容器内路径
+	CONFIG.StoragePath = getEnv("STORAGE_PATH", "./storage")
 	CONFIG.ListenAddr = getEnv("LISTEN_ADDR", ":8080")
 
-	// 从环境变量读取过期时间，单位：小时
 	expiryHours := getFloat64Env("FILE_EXPIRY_HOURS", 24.0)
 	CONFIG.FileExpiryHours = time.Duration(expiryHours * float64(time.Hour))
 
-	// 确保存储目录存在
 	if err := os.MkdirAll(CONFIG.StoragePath, 0755); err != nil {
 		log.Fatal("无法创建存储目录:", err)
 	}
@@ -69,20 +67,59 @@ func getFloat64Env(key string, fallback float64) float64 {
 	return fallback
 }
 
+// getRateLimit 从环境变量 RATE_LIMIT 解析限速规则，如 "60-Minute"
+func getRateLimit() limiter.Rate {
+	value := getEnv("RATE_LIMIT", "100-Minute")
+	parts := strings.Split(value, "-")
+	if len(parts) != 2 {
+		log.Printf("无效的 RATE_LIMIT 格式，使用默认值: %s", value)
+		return limiter.Rate{Period: time.Minute, Limit: 100}
+	}
+
+	limit, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		log.Printf("解析 RATE_LIMIT 数值失败，使用默认值: %s", value)
+		return limiter.Rate{Period: time.Minute, Limit: 100}
+	}
+
+	var period time.Duration
+	switch strings.ToUpper(parts[1]) {
+	case "SECOND", "SECONDS":
+		period = time.Second
+	case "MINUTE", "MINUTES":
+		period = time.Minute
+	case "HOUR", "HOURS":
+		period = time.Hour
+	default:
+		log.Printf("未知的时间单位，使用默认值: %s", value)
+		return limiter.Rate{Period: time.Minute, Limit: 100}
+	}
+
+	return limiter.Rate{
+		Period: period,
+		Limit:  limit,
+	}
+}
+
 func main() {
-	// 🔁 启动后台清理任务（每隔 1 小时检查一次）
 	go startCleanupTask()
 
-	// 限流：100 次/分钟
-	rate := limiter.Rate{
-		Period: 1 * time.Minute,
-		Limit:  100,
-	}
+	// ✅ 使用环境变量配置限速
+	rate := getRateLimit()
 	store := memory.NewStore()
 	limiterMiddleware := stdlib.NewMiddleware(limiter.New(store, rate))
 
 	http.HandleFunc("/", limiterMiddleware.Handler(http.HandlerFunc(rateLimitHandler)).ServeHTTP)
-	log.Printf("服务器启动在 %s，存储路径: %s，文件过期时间: %.1f 小时", CONFIG.ListenAddr, CONFIG.StoragePath, CONFIG.FileExpiryHours.Hours())
+
+	// ✅ 日志输出包含限速信息
+	log.Printf("服务器启动在 %s，存储路径: %s，文件过期时间: %.1f 小时，限速: %d 次/%v",
+		CONFIG.ListenAddr,
+		CONFIG.StoragePath,
+		CONFIG.FileExpiryHours.Hours(),
+		rate.Limit,
+		rate.Period,
+	)
+
 	log.Fatal(http.ListenAndServe(CONFIG.ListenAddr, nil))
 }
 
@@ -136,14 +173,12 @@ func handleProxy(w http.ResponseWriter, r *http.Request, corsHeaders map[string]
 		return
 	}
 
-	// API Key 验证
 	if CONFIG.APIKey != "" && r.Header.Get("X-API-Key") != CONFIG.APIKey {
 		log.Println("Invalid API key:", r.Header.Get("X-API-Key"))
 		responseError(w, corsHeaders, "请求失败")
 		return
 	}
 
-	// 解析 JSON
 	var data map[string]string
 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
 		responseError(w, corsHeaders, "请求失败")
@@ -155,7 +190,6 @@ func handleProxy(w http.ResponseWriter, r *http.Request, corsHeaders map[string]
 		return
 	}
 
-	// 下载图片（最多重试 3 次）
 	var imageData []byte
 	var contentType string
 	var err error
@@ -177,31 +211,26 @@ func handleProxy(w http.ResponseWriter, r *http.Request, corsHeaders map[string]
 		return
 	}
 
-	// 文件扩展名
 	ext := getExtFromContentType(contentType)
 	if ext == "" {
 		ext = "png"
 	}
 
-	// 生成文件名
 	filename := fmt.Sprintf("%s%d-%s.%s", CONFIG.PathPrefix, time.Now().UnixNano(), randomString(6), ext)
 	fullPath := filepath.Join(CONFIG.StoragePath, filename)
 
-	// 确保目录存在
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 		log.Printf("创建目录失败: %v", err)
 		responseError(w, corsHeaders, "存储失败")
 		return
 	}
 
-	// 保存到本地
 	if err := os.WriteFile(fullPath, imageData, 0644); err != nil {
 		log.Printf("保存文件失败: %v", err)
 		responseError(w, corsHeaders, "存储失败")
 		return
 	}
 
-	// 返回结果
 	proxyURL := fmt.Sprintf("%s/%s", CONFIG.CustomDomain, filename)
 	result := map[string]interface{}{
 		"success": true,
@@ -256,17 +285,14 @@ func downloadImage(imageURL string) ([]byte, string, error) {
 }
 
 func handleImage(w http.ResponseWriter, r *http.Request) {
-	// 构造本地文件路径
 	filePath := filepath.Join(CONFIG.StoragePath, strings.TrimPrefix(r.URL.Path, "/"))
 
-	// 检查文件是否存在
 	info, err := os.Stat(filePath)
 	if os.IsNotExist(err) || info.IsDir() {
 		http.Error(w, "图片不存在", http.StatusNotFound)
 		return
 	}
 
-	// 推断 Content-Type
 	ext := strings.ToLower(filepath.Ext(filePath))
 	contentType := "image/png"
 	switch ext {
@@ -326,13 +352,10 @@ func randomString(n int) string {
 	return string(b)
 }
 
-// startCleanupTask 启动一个后台任务，定期清理过期文件
 func startCleanupTask() {
-	// 每隔 1 小时执行一次清理
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 
-	// 立即执行一次清理
 	cleanupOldFiles()
 
 	for {
@@ -343,7 +366,6 @@ func startCleanupTask() {
 	}
 }
 
-// cleanupOldFiles 删除超过 CONFIG.FileExpiryHours 的文件
 func cleanupOldFiles() {
 	now := time.Now()
 	expiryDuration := CONFIG.FileExpiryHours
@@ -351,18 +373,15 @@ func cleanupOldFiles() {
 	err := filepath.Walk(CONFIG.StoragePath, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			log.Printf("访问文件出错 %s: %v", path, err)
-			return nil // 继续遍历其他文件
+			return nil
 		}
 
-		// 只处理文件，跳过目录
 		if info.IsDir() {
 			return nil
 		}
 
-		// 计算文件年龄
 		age := now.Sub(info.ModTime())
 		if age > expiryDuration {
-			// 删除过期文件
 			if err := os.Remove(path); err != nil {
 				log.Printf("删除过期文件失败 %s: %v", path, err)
 			} else {

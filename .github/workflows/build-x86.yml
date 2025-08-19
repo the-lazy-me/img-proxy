@@ -1,0 +1,39 @@
+name: 构建并推送 x86 镜像
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      # 检出代码
+      - name: 检出代码
+        uses: actions/checkout@v3
+
+      # 设置 Docker Buildx，用于多架构构建
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 登录 DockerHub（请在仓库设置 secrets: DOCKERHUB_USERNAME 和 DOCKERHUB_TOKEN）
+      - name: 登录 DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 构建并推送 x86 镜像
+      - name: 构建并推送 x86 镜像
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./dockerfile
+          platforms: linux/amd64 # 指定 x86 架构
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/img-proxy:latest
+
+      # 可选：清理构建缓存
+      - name: 清理构建缓存
+        run: docker builder prune -f

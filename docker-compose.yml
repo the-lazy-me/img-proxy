@@ -1,7 +1,7 @@
 version: '3'
 services:
   pixai-proxy:
-    build: .
+    image: thelazy/img-proxy:latest # 使用 x86 镜像
     ports:
       - "8080:8080"
     volumes:
